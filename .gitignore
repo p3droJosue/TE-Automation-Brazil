@@ -8,3 +8,6 @@ dist/
 docs/
 .DS_Store
 ~$*
+
+# Per-user app state (last DB path / plant)
+modular_architecture/config.json
