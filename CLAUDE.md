@@ -209,6 +209,17 @@ Once the shared-core refactor lands (§8), this manual sync goes away.
 
 ---
 
+### 7.1 What we actually found (OCT 2026 analysis)
+
+See `analysis/BRAZIL_ANALYSIS.md` for the full write-up, and run `python analysis/compare_db_vs_golden.py` to re-check DB vs golden.
+
+- **The template is identical to Mexico's** (same sheets/blocks/rows). Brazil also uses the `Stax` sheet (Sorocaba Canister).
+- **The DBs are NOT Mexico-shaped.** There is no `Reporte Detalle Plantas` / `Pond`. Instead there are 4 Power BI exports in `databases/`: downtime pivots per source system (**APP**, **ITA** = Lucky, **MES** = Sete Lagoas + some ITU lines) and one production list (Planta/Linha/Corte/Sabor/kg). Category names are already English TE categories. The *reader* half of `engine.py` must be replaced; the writer/staging half stays.
+- Product master data (template SKU name, type, % seasoning, rated throughput) is not in any DB, so it needs a per-line SKU master.
+- Templates live in `templates/TE_blank_templates/` and `templates/TE_completed_templates/` (goldens, suffix `_complete`).
+
+---
+
 ## 8. Future consolidation (the shared-core plan)
 
 Once Brazil is working and we've learned what truly differs between countries, extract the common code:
