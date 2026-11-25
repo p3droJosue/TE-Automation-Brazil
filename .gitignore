@@ -11,3 +11,7 @@ docs/
 
 # Per-user app state (last DB path / plant)
 modular_architecture/config.json
+
+# Test outputs of the filler
+*_Filled.xlsm
+*_Filled_warnings.txt

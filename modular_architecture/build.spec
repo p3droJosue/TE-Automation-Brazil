@@ -1,9 +1,9 @@
 # build.spec — PyInstaller spec for TE Template Filler
 # Usage (from the modular_architecture/ directory):
-#   pip install pyinstaller customtkinter xlwings pandas
+#   pip install pyinstaller customtkinter xlwings openpyxl pillow
 #   pyinstaller build.spec
 #
-# Output: dist/TE_Filler.exe  (single-file, no console window)
+# Output: dist/TE_Filler_Brazil.exe  (single-file, no console window)
 
 import sys
 from pathlib import Path
@@ -32,8 +32,7 @@ icon_arg  = icon_path if Path(icon_path).exists() else None
 # xlwings uses COM on Windows; pandas has optional backends — collect them all
 hiddenimports = []
 hiddenimports += collect_submodules("xlwings")
-hiddenimports += collect_submodules("pandas")
-hiddenimports += ["customtkinter", "PIL", "PIL._imagingtk"]
+hiddenimports += ["customtkinter", "PIL", "PIL._imagingtk", "openpyxl"]
 
 # ── Analysis ──────────────────────────────────────────────────────────────────
 a = Analysis(
@@ -57,7 +56,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name="TE_Filler",
+    name="TE_Filler_Brazil",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

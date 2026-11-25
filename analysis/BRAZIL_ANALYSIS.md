@@ -139,7 +139,7 @@ SKU("CORTE ACANALADO", "SAL", name="RUFFLES SAL", ptype="Wavy", seasoning=0.0121
 
 The engine then writes the master rows into the product table in a fixed order. Each SKU's production goes on the matching row, and SKUs with no production stay at 0 / blank, as in the goldens. I can generate a first draft of this master from the OCT goldens; the Brazil team then corrects it.
 
-## 7. What changes in `modular_architecture/`
+## 7. What changes in `modular_architecture/` (implemented — see CLAUDE.md §4)
 
 | Module | Change |
 | --- | --- |
@@ -147,6 +147,6 @@ The engine then writes the master rows into the product table in a fixed order. 
 | `engine.py` — constants | Replace `MANDATORY_HEADERS` / `OPTIONAL_HEADERS` / `ROWS_*` with one `CATEGORY_CELLS` table (§4) plus the kind offsets (TC +1, PC +10). Add `"Stax"` to `_PRODUCT_SHEETS`. Calendar hours = days in month × 24 (from the filename period or a UI field). |
 | `engine.py` — writers | `_write_header` is unchanged. New `_write_hours(ws, kind, cons, cats)` and `_write_products(ws, kind, cons, master, production)`. Mexico's Pond-specific SKU logic (aggregation, PC top-table lookup) goes away. |
 | `engine.py` — runner | `fill_plant` / OneDrive staging / mtime check unchanged. `_fill_plant_core` opens only the template in Excel; the DBs are read up front by pandas. |
-| `plants.py` | Brazil registry from §3 (8 plants, 44 blocks). `Job` gets `source` ("APP"/"ITA"/"MES") + `db_line` in place of `rdp_row` / `pond_plant` / `pond_line`. `match_filename()` for `Snk_TE_<Plant>_P11 2026 OCT(P10 UK).xlsm`. |
+| `plants.py` | Brazil registry from §3 (8 plants, 43 blocks). `Job` gets `source` ("APP"/"ITA"/"MES") + `db_line` in place of `rdp_row` / `pond_plant` / `pond_line`. `match_filename()` for `Snk_TE_<Plant>_P11 2026 OCT(P10 UK).xlsm`. |
 | `app.py` | Branding (title, "Brazil Sites"). The DB picker selects the **databases folder** (4 files) instead of one `.xlsm`. |
 | `build.spec` | `name="TE_Filler_Brazil"`. |

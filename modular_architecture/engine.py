@@ -1,517 +1,407 @@
+"""TE template fill engine — Brazil.
+
+Two halves:
+
+1. **Planning (pure Python, no Excel).** ``load_brazil_db`` reads the four
+   Power BI exports in the databases folder; ``plan_plant`` turns them plus a
+   ``PlantSpec`` into a flat list of cell writes. Nothing here needs Excel,
+   so it can be tested on any machine (see ``analysis/check_against_golden.py``).
+
+2. **Applying (Excel via xlwings).** ``fill_plant`` opens the blank template in
+   Excel, applies the writes, recalculates and saves. OneDrive staging and
+   the mtime safety net are unchanged from the Mexico engine.
+
+Template layout (identical to Mexico): each product sheet holds up to 15
+line blocks, 8 columns wide. Rows below are for the Default layout
+(Extruded / Other / Stax / Cookies / Wafer); TC blocks sit 1 row lower and
+PC blocks 10 rows lower.
+"""
 from __future__ import annotations
 
+import calendar
 import os
+import re
 import shutil
 import tempfile
 import unicodedata
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
-
-import pandas as pd
-import xlwings as xw
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 # =========================
 # Helpers
 # =========================
 def _norm(s: Any) -> str:
+    """Upper-case, strip accents and collapse whitespace."""
     if s is None:
         return ""
-    s = str(s).strip()
-    s = "".join(ch for ch in unicodedata.normalize("NFKD", s) if not unicodedata.combining(ch))
-    return s.upper().strip()
+    s = "".join(ch for ch in unicodedata.normalize("NFKD", str(s)) if not unicodedata.combining(ch))
+    return " ".join(s.upper().split())
 
-def _norm_line(v: Any) -> str:
-    if v is None:
-        return ""
-
-    # Excel often returns numbers as float (e.g., 11.0)
-    if isinstance(v, float):
-        if v.is_integer():
-            return str(int(v))
-        return str(v).strip()
-
-    if isinstance(v, int):
-        return str(v)
-
-    s = str(v).strip()
-    # "11.0" -> "11"
-    if s.endswith(".0") and s[:-2].isdigit():
-        return s[:-2]
-    return s
-
-def _safe_float(v: Any) -> float:
-    try:
-        if v is None or v == "":
-            return 0.0
-        return float(v)
-    except Exception:
-        return 0.0
 
 BLOCK_WIDTH = 8
 
-# =========================
-# RDP (Reporte Detalle Plantas) headers
-# =========================
-MANDATORY_HEADERS = [
-    "Total Hours", "Mantenimiento", "Sanidades", "Paros y Arranques",
-    "Cambios de producto", "Raw Material", "Problemas de calidad", "Others",
-    "Waste", "Paros por SAP", "Reuniones", "Horas excedidas Mtto Prev.",
-    "Horas excedidas Sanidades", "Horas excedidas cambios", "Falta Demanda (Hr)", "Flujo de APT"
-]
+# Column letters inside one block (block 0 starts at column B = 2)
+COL = {"B": 2, "C": 3, "D": 4, "E": 5, "F": 6, "G": 7, "H": 8}
 
-OPTIONAL_HEADERS = [
-    "Falta Materiales", "APT Lleno", "Festivos", "Cuadrillas", "Capex / Pruebas",
-    "Inventario", "Otros", "Fallas Mecánicas Proceso", "Paros proceso operativos",
-    "Fallas Mecánicas empaque", "Paros de empaque Operativo", "Servicios Interno",
-    "Servicios Externo", "Pérdida Vel-Restr. eq.", "Pérd Vel-Mix Gram.",
-    "Pérd vel- Multipack", "TL - Cambio de loop", "Pérd Vel-Pruebas", "Cocimiento TC",
-    "CC Mtto", "CC Sanidad", "CC Changeover", "A005", "A003", "SKUS"
-]
+# Sheets that hold line blocks. "Stax" is used by Brazil (Sorocaba Canister).
+_PRODUCT_SHEETS = ("PC", "TC", "Extruded", "Other", "Cookies or Biscuits", "Wafer", "Stax")
+
+
+def kind_of(sheet: str) -> str:
+    return "PC" if sheet == "PC" else "TC" if sheet == "TC" else "DEFAULT"
+
+
+ROW_OFFSET = {"DEFAULT": 0, "TC": 1, "PC": 10}
 
 # =========================
-# Row maps from VBA Write_Parameters
+# Loss category -> template cell
 # =========================
-ROWS_TEMPLATE_DEFAULT = [18, 22, 23, 24, 25, 35, 36, 39, 14, 26, 27, 30, 31, 32, 19, 32]
-ROWS_TEMPLATE_TC      = [19, 23, 24, 25, 26, 36, 37, 40, 15, 27, 28, 31, 32, 33, 20, 33]
-ROWS_TEMPLATE_PC      = [28, 32, 33, 34, 35, 45, 46, 49, 24, 36, 37, 40, 41, 42, 29, 42]
+# (column letter, row in DEFAULT layout). The DB exports already use the
+# global TE category names, so this table is the whole "translation".
+CALENDAR_CELL = ("C", 18)          # Total calendar time hours = days in month x 24
 
-ROWS_OPT_COOKIES_WAFER = [
-    20, 21, 22, 24, 23, 27, 28, 32, 33, 36, 37, 40, 41,
-    122, 123, 124, 125, 126,
-    38, 39, 40,
-    27, 27, 28, 63
-]
-ROWS_OPT_OTHER_EXTRUDED = [
-    20, 21, 22, 24, 23, 27, 28, 32, 33, 36, 37, 40, 41,
-    106, 107, 108, 109, 110, 111,
-    38, 39, 40,
-    27, 27, 28, 63
-]
-ROWS_OPT_TC = [
-    21, 22, 23, 25, 24, 28, 29, 33, 34, 37, 38, 41, 42,
-    123, 124, 125, 126, 127,
-    30, 39, 40, 41,
-    28, 29, 72
-]
-ROWS_OPT_PC = [
-    30, 31, 32, 34, 33, 37, 38, 42, 43, 46, 47, 50, 51,
-    152, 153, 154, 155, 156,
-    48, 49, 50,
-    37, 37, 38, 91
-]
+CATEGORY_CELLS: Dict[str, Tuple[str, int]] = {
+    # --- left column: time tracking ---
+    "Dark hours: line available to run if needed":      ("C", 19),
+    "Dark hrs: line available to run if needed":        ("C", 19),   # MES spelling
+    "Planned maintenance hours":                        ("C", 22),
+    "Planned sanitation hours":                         ("C", 23),
+    "Planned startup & shutdown hours":                 ("C", 24),
+    "Planned changeovers hours":                        ("C", 25),
+    "Planned network outages hours":                    ("C", 26),
+    "Team meetings hours":                              ("C", 27),
+    "Other scheduled downtime hours":                   ("C", 28),
+    "Maintenance overrun hours":                        ("C", 30),
+    "Sanitation overrun hours":                         ("C", 31),
+    "Changeover overrun hours":                         ("C", 32),
+    "Raw material shortages hours":                     ("C", 35),
+    "Quality issues hours":                             ("C", 36),
+    "Other hours":                                      ("C", 39),
+    # --- right column: dark-hour loss tree ---
+    "Dark hour Loss Tree - RM shortage":                ("G", 20),
+    "Dark hour Loss Tree - FG warehouse":               ("G", 21),
+    "Dark hour Loss Tree - Holiday & Religious reasons": ("G", 22),
+    "Dark hour Loss Tree - CAPEX & Test (R&D)":         ("G", 23),
+    "Dark hour Loss Tree - Staffling":                  ("G", 24),
+    "Dark hour Loss Tree - Staffing":                   ("G", 24),
+    "Dark hour Loss Tree - Inventory":                  ("G", 27),
+    "Dark hour Loss Tree - Other":                      ("G", 28),
+    "Dark hour Loss Tree - Corn Cook Hours":            ("G", 29),   # TC only -> G30
+    # --- right column: breakdowns & utilities ---
+    "Processing Breakdown - Technician Failure":        ("G", 32),
+    "Processing Breakdown - Operational Failure":       ("G", 33),
+    "Packaging Breakdown - Technician Failure":         ("G", 36),
+    "Packaging Breakdown - Operational Failure":        ("G", 37),
+    "Utilities - Internal":                             ("G", 40),
+    "Utilities - External":                             ("G", 41),
+    # --- MES coarse buckets (MES has no sub-split; see BRAZIL_ANALYSIS.md §5) ---
+    # Goldens put MES Packaging all on Technical and MES Utilities all on External.
+    "Packaging Breakdown":                              ("G", 36),
+    "Utilities hours":                                  ("G", 41),
+    # Assumptions pending Brazil team confirmation:
+    "Dark hrs: unavailable due to constraints":         ("G", 28),   # -> dark loss tree "Other"
+    "Processing Breakdown":                             ("G", 32),   # -> Technical failure
+    "FG warehouse":                                     ("E", 32),   # unscheduled FG warehouse box
+    "Unspecified":                                      ("C", 39),   # -> Other hours
+}
+# Categories in the exports that the template calculates itself.
+IGNORED_CATEGORIES = {"PRODUCTIVE TIME", "TOTAL"}
+
+# Only Corn Cook is TC-specific; on other sheets that row does not exist.
+_TC_ONLY = {"Dark hour Loss Tree - Corn Cook Hours"}
+
+_CATEGORY_LOOKUP = {_norm(k): k for k in CATEGORY_CELLS}
+
+# Product table / production table layouts per kind:
+#   (first product row, first production row, number of product rows)
+PRODUCT_LAYOUT = {
+    "DEFAULT": (44, 60, 12),
+    "TC":      (45, 69, 20),
+    "PC":      (54, 88, 30),
+}
+# Product-table columns the engine may write. Column G is a formula on PC/TC
+# (rated throughput lookups) and on Stax (VLOOKUP on the line type), so it
+# is left alone there; column H is always a formula.
+PRODUCT_COLS = {"PC": "BCDEF", "TC": "BCDEF", "Stax": "BCDEF"}
+DEFAULT_PRODUCT_COLS = "BCDEFG"
+
+# Header row per kind (line name dropdown)
+HEADER_ROW = {"DEFAULT": 4, "TC": 4, "PC": 6}
+TYPE_CELL = ("C", 7)                  # line type dropdown (Default layout only)
+TE_TARGET_ROW = {"DEFAULT": 80, "TC": 97, "PC": 126}   # column G
+PC_FRYER_ROWS = (10, 11, 12)          # wash water temp, moisture aim, surface water (column C)
+
 
 # =========================
 # Models
 # =========================
 @dataclass(frozen=True)
+class SKU:
+    """One row of a line's product table (master data, not in the DB)."""
+    name: str
+    ptype: Any = None        # column C — product type
+    seasoning: Any = None    # column D — % seasoning
+    oil: Any = None          # column E — % oil spray (PC/TC)
+    col_f: Any = None        # column F — non-IPS throughput (PC/TC) / extra (Default)
+    rated: Any = None        # column G — rated throughput / max kgs
+    db_keys: Tuple[Tuple[Optional[str], Optional[str]], ...] = ()  # (Corte, Sabor) pairs feeding this row
+
+
+@dataclass(frozen=True)
 class Job:
-    sheet: str                  # template sheet to write
-    kind: str                   # "DEFAULT" | "TC" | "PC"
-    cons: int                   # block index (0..)
-    header_text: str            # line display name
-    rdp_row: int                # row in Reporte Detalle Plantas
-    pond_plant: str             # Pond col2 plant value (e.g. "PLANTA MÉXICO")
-    pond_line: str              # Pond col3 line (e.g. "A3", "B1")
-    type_value: Optional[str] = None  # writes into row7 type cell (Other/Extruded)
-    # Sabritas Pte 128 ("Mezcladotecnia") has 18–31 condimento SKUs per line,
-    # which exceeds the 12-slot product table. Set aggregate_skus=True to
-    # collapse all matching SKUs into one row whose velocity is the throughput
-    # weighted by production time (= total_prod / sum(prod_i / vel_i)).
-    aggregate_skus: bool = False
-    aggregate_name: Optional[str] = None  # SKU name to write (e.g., "CONDIMENTO L2")
+    sheet: str                    # template sheet
+    cons: int                     # block index (0..14)
+    header_text: str              # line name as in the template dropdown
+    source: str                   # "APP" | "ITA" | "MES" — which downtime export
+    db_line: str                  # 'Linha' in the exports
+    type_value: Optional[str] = None      # row 7 line type (Default layout only)
+    te_target: Optional[float] = None     # TE % target
+    fryer: Optional[Tuple[Any, Any, Any]] = None  # PC: wash water temp, moisture aim, surface water
+    skus: Tuple[SKU, ...] = ()
+
+    @property
+    def kind(self) -> str:
+        return kind_of(self.sheet)
+
 
 @dataclass(frozen=True)
 class PlantSpec:
     key: str
     jobs: List[Job]
 
-# =========================
-# Excel reading
-# =========================
-def _pick_sheet(wb: xw.Book, preferred: str, fallbacks: List[str]) -> xw.Sheet:
-    names = [s.name for s in wb.sheets]
-    if preferred in names:
-        return wb.sheets[preferred]
-    for fb in fallbacks:
-        if fb in names:
-            return wb.sheets[fb]
-    raise ValueError(f"Could not find sheet '{preferred}' (or fallbacks {fallbacks}). Available: {names}")
 
-def _rdp_header_map(ws_rdp: xw.Sheet, header_row: int = 2, max_cols: int = 2000) -> Dict[str, int]:
-    last_col = min(ws_rdp.api.UsedRange.Columns.Count, max_cols)
-    headers = ws_rdp.range((header_row, 1), (header_row, last_col)).value
-    m: Dict[str, int] = {}
-    # The RDP has multiple "Waste" columns (one in kg, one as %, sometimes a dashboard total).
-    # The percentage Waste is always the one immediately following "ETE  %", so capture it
-    # explicitly and override the dict (which otherwise picks the last duplicate).
-    ete_idx: Optional[int] = None
-    waste_after_ete: Optional[int] = None
-    for idx, h in enumerate(headers, start=1):
-        if isinstance(h, str) and h.strip():
-            key = h.strip()
-            m[key] = idx
-            collapsed = " ".join(key.split())
-            if collapsed == "ETE %":
-                ete_idx = idx
-            elif key == "Waste" and ete_idx is not None and waste_after_ete is None:
-                waste_after_ete = idx
-    if waste_after_ete is not None:
-        m["Waste"] = waste_after_ete
-    return m
+@dataclass
+class Write:
+    sheet: str
+    row: int
+    col: int
+    value: Any
 
-def _values_by_headers(ws_rdp: xw.Sheet, row: int, hdr: Dict[str, int], names: List[str]) -> List[Any]:
-    out = []
-    for k in names:
-        c = hdr.get(str(k).strip())
-        out.append(ws_rdp.range((row, c)).value if c else None)
-    return out
-
-def _pond_last_row(ws_pond: xw.Sheet) -> int:
-    # last used row based on column A
-    # xlUp = -4162, but use the COM constant directly
-    return ws_pond.api.Cells(ws_pond.api.Rows.Count, 1).End(-4162).Row
-
-def _load_pond_df(ws_pond: xw.Sheet, last_col: int = 47) -> pd.DataFrame:
-    """
-    Load Pond as a DataFrame using ONLY positional columns.
-    We read A..AU (1..47) to support PC params (col47) and material rows.
-    """
-    last_row = _pond_last_row(ws_pond)
-    data = ws_pond.range((1, 1), (last_row, last_col)).value
-    if not data or len(data) < 2:
-        return pd.DataFrame()
-
-    # DO NOT trust excel headers (often duplicated/blank). Use c1..c47
-    cols = [f"c{i}" for i in range(1, last_col + 1)]
-    df = pd.DataFrame(data[1:], columns=cols)
-    return df
 
 # =========================
-# Pond extractors
+# Reading the Brazil exports
 # =========================
-def pond_default_names_velprod(df: pd.DataFrame, plant: str, line: str,
-                               aggregate: bool = False,
-                               agg_name: Optional[str] = None) -> Tuple[List[str], List[float]]:
+@dataclass
+class BrazilDB:
+    # downtime[source][LINE][category] = hours
+    downtime: Dict[str, Dict[str, Dict[str, float]]] = field(default_factory=dict)
+    # production[LINE] = [(corte, sabor, kg), ...]
+    production: Dict[str, List[Tuple[Optional[str], Optional[str], float]]] = field(default_factory=dict)
+    files: Dict[str, str] = field(default_factory=dict)   # source -> filename
+    filters: Dict[str, str] = field(default_factory=dict)  # source -> "Applied filters" text
+
+
+_SOURCE_BY_VALUE_LABEL = {"TEMPO_DBL": "APP", "HORAS ITA": "ITA", "DT HORAS": "MES"}
+
+
+def _read_rows(path: str) -> List[Tuple[Any, ...]]:
+    import openpyxl  # local import keeps xlwings-only installs light
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    try:
+        ws = wb.worksheets[0]
+        return [tuple(r) for r in ws.iter_rows(values_only=True)]
+    finally:
+        wb.close()
+
+
+def _filters_text(rows: Sequence[Tuple[Any, ...]]) -> str:
+    for r in rows:
+        if r and isinstance(r[0], str) and r[0].startswith("Applied filters"):
+            return r[0]
+    return ""
+
+
+def load_brazil_db(folder: str) -> BrazilDB:
+    """Read every .xlsx export in *folder* and classify it by content:
+
+    * downtime pivot: A1='Linha', row 2 holds the value label
+      (TEMPO_DBL -> APP, HORAS ITA -> ITA, DT Horas -> MES)
+    * production list: header row Planta | Linha | Corte | Sabor | Produção Real KG
     """
-    DEFAULT & TC use:
-      - name: col5 (E) => c5
-      - vel : col7 (G) => c7
-      - prod: col8 (H) => c8
-      Filter: plant (col2=c2), line (col3=c3), prod>0
-
-    If aggregate=True (used for Sabritas Pte 128 / Mezcladotecnia where each
-    line has dozens of condimento SKUs), the matching rows are collapsed into
-    a single entry: one name, the throughput weighted by production time, and
-    the total production.
-    """
-    if df.empty:
-        return [], []
-
-    plant_ser = df["c2"].astype(str).map(_norm)
-    line_ser  = df["c3"].map(_norm_line)
-    prod_ser  = pd.to_numeric(df["c8"], errors="coerce").fillna(0)
-
-    mask = (plant_ser == _norm(plant)) & (line_ser == _norm_line(line)) & (prod_ser > 0)
-    d = df.loc[mask].copy()
-    if d.empty:
-        return [], []
-
-    names = d["c5"].fillna("").astype(str).tolist()
-    vel = pd.to_numeric(d["c7"], errors="coerce").fillna(0).tolist()
-    prod = pd.to_numeric(d["c8"], errors="coerce").fillna(0).tolist()
-
-    if aggregate:
-        total_prod = sum(prod)
-        total_time = sum(p / v for p, v in zip(prod, vel) if v and v > 0)
-        if total_time <= 0:
-            return [], []
-        weighted_vel = total_prod / total_time
-        name = agg_name or f"CONDIMENTO {line}"
-        return [name], [weighted_vel, total_prod]
-
-    return names, vel + prod
-
-def pond_pc_names_velprod(df: pd.DataFrame, ws_pond: xw.Sheet, template_location: str,
-                          plant: str, line: str) -> Tuple[List[str], List[float]]:
-    """
-    PC needs (Pond material columns):
-      - Product Name  : col5  ('Descripción')
-      - Product Type  : col21 ('Product Type', e.g. 'Flats', 'Ridged')
-      - % Seasoning   : col22 ('% sazonado')
-      - % Oil Spray   : col23 ('% oil spray Total ')
-      - Production    : col8  ('Actual Prod')
-    Plus PC extra params from Pond top-table (rows 2..8). The top-table is keyed by
-    Centro Planta (CECO) in col 28 and friendly name in col 29; we look up by CECO
-    (which we read from the material rows) so plant-name differences like
-    'Celaya' vs 'Celaya Salado' or 'Mexicali 1 PMF' vs 'Mexicali Plant' don't matter.
-    The extra params come from:
-      wash water temp = col32 ('Agua de lavador (°C)')
-      moisture aim    = col33 ('Humedad de producto')
-      surface water   = col34 ('Humedad superficial')
-      gross solids    = col47 ('Sólidos gross')
-    """
-    if df.empty:
-        return [], []
-
-    # Material rows filter
-    plant_ser = df["c2"].astype(str).map(_norm)
-    line_ser  = df["c3"].map(_norm_line)
-    prod_ser  = pd.to_numeric(df["c8"], errors="coerce").fillna(0)
-    mask = (plant_ser == _norm(plant)) & (line_ser == _norm_line(line)) & (prod_ser > 0)
-    d = df.loc[mask].copy()
-    if d.empty:
-        return [], []
-
-    product_names = d["c5"].fillna("").astype(str).tolist()
-    product_types = d["c21"].fillna("").astype(str).tolist()  # Product Type ('Flats', etc.)
-
-    seasoning  = pd.to_numeric(d["c22"], errors="coerce").fillna(0).tolist()  # % sazonado
-    oil_spray  = pd.to_numeric(d["c23"], errors="coerce").fillna(0).tolist()  # % oil spray Total
-    production = pd.to_numeric(d["c8"],  errors="coerce").fillna(0).tolist()
-
-    # CECO from the material rows — disambiguates the top-table row.
-    ceco_series = pd.to_numeric(d["c1"], errors="coerce").dropna()
-    ceco = int(ceco_series.iloc[0]) if not ceco_series.empty else None
-
-    loc_norm = _norm(template_location)
-    found = None
-    # Top-table currently runs rows 2..9, but scan a few extra rows in case
-    # more PC plants are added; we stop at the first blank CECO row.
-    for r in range(2, 16):
-        v_ceco = ws_pond.range((r, 28)).value
-        v_name = ws_pond.range((r, 29)).value
-        if v_ceco is None and v_name is None:
-            break
-        if ceco is not None and v_ceco is not None:
-            try:
-                if int(v_ceco) == ceco:
-                    found = r
-                    break
-            except (ValueError, TypeError):
-                pass
-        if _norm(v_name) == loc_norm:
-            found = r
-            break
-    if found is None:
-        raise ValueError(
-            f"PC extra params not found in Pond rows 2..8 for location "
-            f"'{template_location}' (ceco={ceco})"
-        )
-
-    wash_temp = ws_pond.range((found, 32)).value   # col32 (Agua de lavador)
-    moisture  = ws_pond.range((found, 33)).value   # col33 (Humedad de producto)
-    surface   = ws_pond.range((found, 34)).value   # col34 (Humedad superficial)
-    gross_sol = ws_pond.range((found, 47)).value   # col47 (Sólidos gross)
-
-    # names array is 2 halves (name + type)
-    names = product_names + product_types
-
-    # vel_prod array: seasoning + oil + production + extras(4)
-    vel_prod = seasoning + oil_spray + production + [wash_temp, moisture, surface, gross_sol]
-    return names, vel_prod
-
-# =========================
-# Writers (match VBA layouts)
-# =========================
-def _write_header(ws: xw.Sheet, sheet_name: str, cons: int, header_text: str, type_value: Optional[str]):
-    # PC uses row 6 headers; others use row 4
-    if sheet_name == "PC":
-        ws.range((6, 2 + BLOCK_WIDTH * cons)).value = header_text
-    else:
-        ws.range((4, 2 + BLOCK_WIDTH * cons)).value = header_text
-
-    # type cell row 7, base col 3
-    if type_value is not None:
-        ws.range((7, 3 + BLOCK_WIDTH * cons)).value = type_value
-
-def _write_mandatory(ws: xw.Sheet, cons: int, rows_template: List[int], vals: List[Any]):
-    sumador = BLOCK_WIDTH * cons
-    # first 15 into column C, last into column E
-    for i in range(len(rows_template) - 1):
-        ws.range((rows_template[i], 3 + sumador)).value = vals[i]
-    ws.range((rows_template[-1], 5 + sumador)).value = vals[-1]
-
-_UNSET = object()
-
-def _write_optional(ws: xw.Sheet, cons: int, rows_opt: List[int], opt_vals: List[Any],
-                    first_to_col7: int, second_from: int, second_to: int, second_col5: bool,
-                    last_write_val=_UNSET, last_row_idx: int = 24):
-    """
-    Generic optional writing used across tabs.
-    last_write_val: explicit value for the final col7 write. Defaults to opt[24] (SKUS).
-                    Pass 0 for TC (VBA writes Optional_Parameters(25)=0).
-    last_row_idx:   index into rows_opt for the final SKUS col7 write.
-                    24 for COOKIES/WAFER/TC/PC (25-item arrays), 25 for OTHER/EXTRUDED (26-item array).
-    """
-    sumador = BLOCK_WIDTH * cons
-    opt = list(opt_vals)
-    if len(opt) < 25:
-        opt.extend([None] * (25 - len(opt)))
-
-    # first chunk to col7
-    for i in range(0, first_to_col7 + 1):
-        ws.range((rows_opt[i], 7 + sumador)).value = opt[i]
-
-    # second chunk to col5
-    if second_col5:
-        for i in range(second_from, second_to + 1):
-            ws.range((rows_opt[i], 5 + sumador)).value = opt[i]
-
-    # final col7 write (SKUS destination row)
-    final_v = opt[24] if last_write_val is _UNSET else last_write_val
-    ws.range((rows_opt[last_row_idx], 7 + sumador)).value = final_v
-
-def _write_default_sku(ws: xw.Sheet, sheet_name: str, cons: int, names: List[str], vel_prod: List[float]):
-    sumador = BLOCK_WIDTH * cons
-    # default layout
-    if sheet_name in ("Other", "Extruded"):
-        row_1, row_2 = 44, 60
-    else:
-        row_1, row_2 = 44, 68
-
-    if not names or not vel_prod:
-        return
-
-    n = min(len(names), len(vel_prod) // 2)
-    if n <= 0:
-        return
-
-    ws.range((row_1, 2 + sumador)).options(transpose=True).value = names[:n]           # names
-    ws.range((row_1, 7 + sumador)).options(transpose=True).value = vel_prod[:n]        # vel
-    ws.range((row_2, 3 + sumador)).options(transpose=True).value = vel_prod[n:n + n]   # prod
-
-def _write_tc_sku(ws: xw.Sheet, cons: int, names: List[str], vel_prod: List[float]):
-    """
-    TC VBA layout:
-      row_1=45, row_2=69, velocity goes to col (6 + sumador),
-      production goes to col (3 + sumador), and it sets "Other" at row_1+idx col (3+sumador).
-    """
-    sumador = BLOCK_WIDTH * cons
-    row_1, row_2 = 45, 69
-
-    if not names or not vel_prod:
-        return
-
-    n = min(len(names), len(vel_prod) // 2)
-    if n <= 0:
-        return
-
-    vel = vel_prod[:n]
-    prod = vel_prod[n:n + n]
-
-    for idx in range(n):
-        ws.range((row_1 + idx, 3 + sumador)).value = "Other"
-        ws.range((row_1 + idx, 2 + sumador)).value = names[idx]
-        ws.range((row_1 + idx, 6 + sumador)).value = vel[idx]      # TC special column
-
-        ws.range((row_2 + idx, 3 + sumador)).value = prod[idx]
-
-def _write_pc(ws: xw.Sheet, cons: int, mandatory: List[Any], optional: List[Any],
-              names: List[str], vel_prod: List[float]):
-    """
-    PC VBA layout:
-      - mandatory rows: ROWS_TEMPLATE_PC
-      - product table row_1=54:
-          col2 names, col3 types, col4 seasoning, col5 oil
-      - production table row_2=88:
-          col3 production
-      - extra params into C10,C11,C12,C17 for the block
-    """
-    sumador = BLOCK_WIDTH * cons
-
-    # mandatory
-    _write_mandatory(ws, cons, ROWS_TEMPLATE_PC, mandatory)
-
-    if not names or not vel_prod:
-        # optional still gets written
-        _write_optional(ws, cons, ROWS_OPT_PC, optional, first_to_col7=17, second_from=18, second_to=23, second_col5=True)
-        return
-
-    n = len(names) // 2
-    if n <= 0:
-        _write_optional(ws, cons, ROWS_OPT_PC, optional, first_to_col7=17, second_from=18, second_to=23, second_col5=True)
-        return
-
-    # Split arrays
-    prod_names = names[:n]
-    prod_types = names[n:n + n]
-
-    seasoning = vel_prod[:n]
-    oil = vel_prod[n:n + n]
-    production = vel_prod[2 * n: 3 * n]
-
-    extras = vel_prod[3 * n: 3 * n + 4]  # [wash, moisture, surface, gross]
-    while len(extras) < 4:
-        extras.append(None)
-
-    row_1, row_2 = 54, 88
-
-    ws.range((row_1, 2 + sumador)).options(transpose=True).value = prod_names
-    ws.range((row_1, 3 + sumador)).options(transpose=True).value = prod_types
-    ws.range((row_1, 4 + sumador)).options(transpose=True).value = seasoning
-    ws.range((row_1, 5 + sumador)).options(transpose=True).value = oil
-
-    ws.range((row_2, 3 + sumador)).options(transpose=True).value = production
-
-    # Extra operating/process parameters (same cells as VBA)
-    ws.range((10, 3 + sumador)).value = extras[0]
-    ws.range((11, 3 + sumador)).value = extras[1]
-    ws.range((12, 3 + sumador)).value = extras[2]
-    ws.range((17, 3 + sumador)).value = extras[3]
-
-    # optional
-    _write_optional(ws, cons, ROWS_OPT_PC, optional, first_to_col7=17, second_from=18, second_to=23, second_col5=True)
-
-# =========================
-# Stale-data cleanup
-# =========================
-_PRODUCT_SHEETS = ("PC", "TC", "Extruded", "Other", "Cookies or Biscuits", "Wafer")
-_MAX_BLOCKS = 15  # templates have up to 15 (cons 0..14)
-
-def _clear_unused_sheets(wb_tpl: xw.Book, plant: PlantSpec) -> None:
-    """
-    Run All overwrites templates in place. If a file was previously filled
-    using a different PlantSpec (e.g. the bare "Snk_TE_Celaya" file was
-    matched to CELAYA_GAMESA by an earlier code version and got Cookies/Wafer
-    data, then is re-run as CELAYA_SABRITAS), the sheets the new spec doesn't
-    touch keep the old data and contaminate the Summary.
-
-    For each product sheet not used by *plant*, zero out the input cells the
-    engine writes (SKU table + Total Hours per block). The template's formulas
-    cascade those to 0, so the Summary reflects only the new spec's contribution.
-    """
-    used_sheets = {job.sheet for job in plant.jobs}
-    sheets_in_wb = {s.name for s in wb_tpl.sheets}
-    for sheet_name in _PRODUCT_SHEETS:
-        if sheet_name in used_sheets or sheet_name not in sheets_in_wb:
+    if not os.path.isdir(folder):
+        raise ValueError(f"Databases folder not found: {folder}")
+    db = BrazilDB()
+    for fname in sorted(os.listdir(folder)):
+        if not fname.lower().endswith((".xlsx", ".xlsm")) or fname.startswith("~$"):
             continue
-        ws = wb_tpl.sheets[sheet_name]
-        # Drop sheet protection so we can wipe locked input cells, then restore.
-        # Pass "" so Excel doesn't pop the password dialog: if the sheet has a
-        # real password, Unprotect throws and we skip — locked cells can't have
-        # accumulated stale data from a previous fill anyway.
-        was_protected = bool(ws.api.ProtectContents)
-        if was_protected:
-            try:
-                ws.api.Unprotect("")
-            except Exception:
+        rows = _read_rows(os.path.join(folder, fname))
+        if len(rows) < 2 or not rows[0]:
+            continue
+        head = [_norm(v) for v in rows[0]]
+
+        if head[:2] == ["PLANTA", "LINHA"]:
+            for r in rows[1:]:
+                if len(r) < 5 or not r[1] or not isinstance(r[4], (int, float)):
+                    continue
+                db.production.setdefault(_norm(r[1]), []).append(
+                    (r[2] if r[2] else None, r[3] if r[3] else None, float(r[4])))
+            db.files["PROD"] = fname
+            db.filters["PROD"] = _filters_text(rows)
+            continue
+
+        if head[0] == "LINHA":
+            label = next((_norm(v) for v in rows[1][1:] if v), "")
+            source = _SOURCE_BY_VALUE_LABEL.get(label)
+            if source is None:
                 continue
-        try:
-            for cons in range(_MAX_BLOCKS):
-                sumador = BLOCK_WIDTH * cons
-                ws.range((18, 3 + sumador)).value = None  # Total Hours
-                ws.range((44, 2 + sumador), (87, 2 + sumador)).value = None  # SKU names
-                ws.range((44, 7 + sumador), (87, 7 + sumador)).value = None  # velocities
-                ws.range((60, 3 + sumador), (87, 3 + sumador)).value = None  # productions
-        finally:
-            if was_protected:
-                try:
-                    ws.api.Protect()
-                except Exception:
-                    pass
+            if source in db.files:
+                raise ValueError(f"Two {source} exports in the databases folder: "
+                                 f"{db.files[source]} and {fname}")
+            lines = [_norm(v) for v in rows[0][1:]]
+            data: Dict[str, Dict[str, float]] = {}
+            for r in rows[2:]:
+                cat = r[0]
+                if not isinstance(cat, str) or cat.startswith("Applied filters"):
+                    continue
+                for ln, v in zip(lines, r[1:]):
+                    if ln and ln != "TOTAL" and isinstance(v, (int, float)):
+                        data.setdefault(ln, {})[cat.strip()] = float(v)
+            db.downtime[source] = data
+            db.files[source] = fname
+            db.filters[source] = _filters_text(rows)
+
+    missing = [s for s in ("APP", "ITA", "MES", "PROD") if s not in db.files]
+    if missing:
+        names = {"APP": "Detalhe True Efficiency - APP", "ITA": "Detalhe True Efficiency - ITA",
+                 "MES": "Detalle True Efficiency - MES", "PROD": "Detalle True Efficiency (production)"}
+        raise ValueError("Databases folder is missing: " + ", ".join(names[m] for m in missing))
+    return db
+
 
 # =========================
-# Engine runner
+# Calendar hours
+# =========================
+_MONTHS = {m: i for i, m in enumerate(
+    ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"], start=1)}
+
+
+def calendar_hours_from_filename(path: str) -> Optional[float]:
+    """'Snk_TE_ITU_P11 2026 OCT(P10 UK).xlsm' -> 31 * 24 = 744."""
+    m = re.search(r"(20\d\d)\s*([A-Za-z]{3})", os.path.basename(path))
+    if not m or m.group(2).upper() not in _MONTHS:
+        return None
+    year, month = int(m.group(1)), _MONTHS[m.group(2).upper()]
+    return float(calendar.monthrange(year, month)[1] * 24)
+
+
+# =========================
+# Planning
+# =========================
+def _cell(job: Job, col_letter: str, row: int) -> Tuple[int, int]:
+    return row + ROW_OFFSET[job.kind], COL[col_letter] + BLOCK_WIDTH * job.cons
+
+
+def _sku_key(corte: Any, sabor: Any) -> Tuple[str, str]:
+    return _norm(corte), _norm(sabor)
+
+
+def plan_job(db: BrazilDB, job: Job, calendar_hours: float) -> Tuple[List[Write], List[str]]:
+    writes: List[Write] = []
+    warns: List[str] = []
+    s, kind, o = job.sheet, job.kind, BLOCK_WIDTH * job.cons
+    tag = f"{job.sheet} / {job.header_text}"
+
+    def put(row: int, col: int, value: Any) -> None:
+        # Only real values are written. Output always starts from a fresh copy
+        # of the blank template, so there is nothing stale to clear — and
+        # clearing would hit merged cells (e.g. D:E on Other product rows),
+        # which Excel refuses.
+        if value is not None and value != "":
+            writes.append(Write(s, row, col, value))
+
+    # 1) header + static per-line values
+    put(HEADER_ROW[kind], COL["B"] + o, job.header_text)
+    if kind == "DEFAULT" and job.type_value is not None:
+        put(TYPE_CELL[1], COL[TYPE_CELL[0]] + o, job.type_value)
+    if job.te_target is not None:
+        put(TE_TARGET_ROW[kind], COL["G"] + o, job.te_target)
+    if kind == "PC" and job.fryer:
+        for r, v in zip(PC_FRYER_ROWS, job.fryer):
+            put(r, COL["C"] + o, v)
+
+    # 2) hours
+    put(*_cell(job, *CALENDAR_CELL), calendar_hours)
+    src = db.downtime.get(job.source, {})
+    line_data = src.get(_norm(job.db_line))
+    if line_data is None:
+        warns.append(f"{tag}: line '{job.db_line}' not found in the {job.source} export — hours left blank.")
+        line_data = {}
+    values: Dict[Tuple[int, int], float] = {}
+    for col_letter, row in set(CATEGORY_CELLS.values()):
+        if row == 29 and kind != "TC":
+            continue
+        values[_cell(job, col_letter, row)] = None  # type: ignore[assignment]
+    for cat, hours in line_data.items():
+        key = _CATEGORY_LOOKUP.get(_norm(cat))
+        if key is None:
+            if _norm(cat) not in IGNORED_CATEGORIES:
+                warns.append(f"{tag}: unknown category '{cat}' ({hours:.2f} h) not written.")
+            continue
+        if key in _TC_ONLY and kind != "TC":
+            warns.append(f"{tag}: '{cat}' ({hours:.2f} h) only exists on TC — not written.")
+            continue
+        rc = _cell(job, *CATEGORY_CELLS[key])
+        values[rc] = (values.get(rc) or 0.0) + hours
+    for (r, c), v in sorted(values.items()):
+        put(r, c, v)
+
+    # 3) products + production
+    p1, p2, nrows = PRODUCT_LAYOUT[kind]
+    skus = list(job.skus)
+    by_key: Dict[Tuple[str, str], int] = {}
+    for i, sku in enumerate(skus):
+        for k in sku.db_keys:
+            by_key[_sku_key(*k)] = i
+    prod = [0.0] * len(skus)
+    extra: List[Tuple[str, float]] = []
+    for corte, sabor, kg in db.production.get(_norm(job.db_line), []):
+        i = by_key.get(_sku_key(corte, sabor))
+        if i is None and len(skus) == 1 and not skus[0].db_keys:
+            i = 0  # single-SKU line (e.g. Amacoco: no Corte/Sabor in the export)
+        if i is None:
+            label = " ".join(str(x) for x in (corte, sabor) if x) or job.db_line
+            extra.append((label, kg))
+            warns.append(f"{tag}: SKU '{label}' ({kg:,.0f} kg) is not in the SKU master — "
+                         f"added as a new row; fill its type/seasoning/throughput by hand.")
+        else:
+            prod[i] += kg
+    if len(skus) + len(extra) > nrows:
+        raise ValueError(f"{tag}: {len(skus) + len(extra)} SKUs do not fit the {nrows}-row product table.")
+    if job.skus and not db.production.get(_norm(job.db_line)):
+        warns.append(f"{tag}: no production rows for line '{job.db_line}' in the production export.")
+
+    for i in range(nrows):
+        r1, r2 = p1 + i, p2 + i
+        if i < len(skus):
+            k = skus[i]
+            row_vals = [k.name, k.ptype, k.seasoning, k.oil, k.col_f, k.rated]
+            kg = prod[i] or None
+        elif i - len(skus) < len(extra):
+            name, kg = extra[i - len(skus)]
+            row_vals = [name, None, None, None, None, None]
+        else:
+            row_vals = [None] * 6
+            kg = None
+        cols = PRODUCT_COLS.get(job.sheet, DEFAULT_PRODUCT_COLS)
+        for col_letter, v in zip("BCDEFG", row_vals):
+            if col_letter in cols:
+                put(r1, COL[col_letter] + o, v)
+        put(r2, COL["C"] + o, kg)
+    return writes, warns
+
+
+def plan_plant(db: BrazilDB, plant: PlantSpec, calendar_hours: float) -> Tuple[List[Write], List[str]]:
+    writes: List[Write] = []
+    warns: List[str] = []
+    for job in plant.jobs:
+        w, msgs = plan_job(db, job, calendar_hours)
+        writes += w
+        warns += msgs
+    return writes, warns
+
+
+# =========================
+# Engine runner (Excel)
 # =========================
 def default_out_path(blank_path: str) -> str:
     folder = os.path.dirname(blank_path)
@@ -525,6 +415,7 @@ def default_out_path(blank_path: str) -> str:
         base = f"{root}_Filled{ext}"
     return os.path.join(folder, base)
 
+
 def _is_onedrive_path(path: str) -> bool:
     """OneDrive's sync agent acquires file locks while a workbook is open in
     Excel — when an automated save fires those operations COM-throw
@@ -534,36 +425,38 @@ def _is_onedrive_path(path: str) -> bool:
     return "onedrive" in (path or "").lower()
 
 
-def fill_plant(db_path: str, blank_path: str, out_path: str, plant: PlantSpec, visible: bool = False) -> None:
-    """Run the fill, staging through a local temp folder when any input
-    lives on OneDrive. The core engine then operates on plain local files
-    that the sync agent can't touch, and we copy the result back to the
-    OneDrive location as a single write at the end.
+def fill_plant(db_path: str, blank_path: str, out_path: str, plant: PlantSpec,
+               visible: bool = False) -> List[str]:
+    """Fill one plant template. *db_path* is the **databases folder** holding
+    the four Brazil exports. Returns a list of warnings (may be empty).
 
-    Excel COM occasionally throws "Cannot access '<file>'" after the
-    workbook has already been written to disk (most often when OneDrive's
-    sync agent grabs the file the instant save returns). To avoid flagging
+    The workbook is staged through a local temp folder when any path lives
+    on OneDrive. Excel COM occasionally throws "Cannot access '<file>'"
+    after the workbook has already been written to disk; to avoid flagging
     those runs as failed, we snapshot the output file's mtime before
-    starting and treat an exception as a success if the file has been
-    rewritten in the meantime.
+    starting and treat an exception as success if the file was rewritten.
     """
+    # Plan first — pure Python, so data problems fail fast without Excel.
+    db = load_brazil_db(db_path)
+    hours = calendar_hours_from_filename(blank_path)
+    if hours is None:
+        raise ValueError("Could not read the month from the template filename "
+                         "(expected e.g. '..._P11 2026 OCT(P10 UK).xlsm').")
+    writes, warnings = plan_plant(db, plant, hours)
+
     mtime_before = (
         os.path.getmtime(out_path) if os.path.exists(out_path) else 0.0
     )
 
     try:
-        if (_is_onedrive_path(blank_path)
-                or _is_onedrive_path(db_path)
-                or _is_onedrive_path(out_path)):
+        if _is_onedrive_path(blank_path) or _is_onedrive_path(out_path):
             with tempfile.TemporaryDirectory(prefix="te_filler_") as tmpdir:
-                local_db  = os.path.join(tmpdir, "db_"  + os.path.basename(db_path))
                 local_tpl = os.path.join(tmpdir, "tpl_" + os.path.basename(blank_path))
-                shutil.copy2(db_path, local_db)
                 shutil.copy2(blank_path, local_tpl)
-                _fill_plant_core(local_db, local_tpl, local_tpl, plant, visible)
+                _fill_plant_core(local_tpl, local_tpl, writes, visible)
                 shutil.copy2(local_tpl, out_path)
         else:
-            _fill_plant_core(db_path, blank_path, out_path, plant, visible)
+            _fill_plant_core(blank_path, out_path, writes, visible)
     except Exception:
         # If the output file's mtime advanced during this call the bytes
         # are on disk — whatever COM error fired afterwards (OneDrive lock
@@ -571,92 +464,29 @@ def fill_plant(db_path: str, blank_path: str, out_path: str, plant: PlantSpec, v
         try:
             if (os.path.exists(out_path)
                     and os.path.getmtime(out_path) > mtime_before + 0.5):
-                return
+                return warnings
         except OSError:
             pass
         raise
+    return warnings
 
 
-def _fill_plant_core(db_path: str, blank_path: str, out_path: str, plant: PlantSpec, visible: bool = False) -> None:
+def _fill_plant_core(blank_path: str, out_path: str, writes: List[Write], visible: bool = False) -> None:
+    import xlwings as xw  # Windows + Excel only
+
     app = xw.App(visible=visible, add_book=False)
     app.display_alerts = False
     app.screen_updating = False
     try:
-        wb_db = app.books.open(db_path, update_links=False, read_only=True)
         wb_tpl = app.books.open(blank_path, update_links=False)
-
-        # Excel calculation is critical
-        app.api.CalculateFullRebuild()
-
-        ws_rdp = _pick_sheet(wb_db, "Reporte Detalle Plantas", ["Reporte Detalle Plantas (2)"])
-        ws_pond = _pick_sheet(wb_db, "Pond", [])
-
-        hdr = _rdp_header_map(ws_rdp, header_row=2, max_cols=2000)
-        # Only mandatory headers gate the run — optional ones (e.g. A005/A003/SKUS)
-        # are dropped from some monthly DBs (FEB 2026 lost them) and the downstream
-        # writers already treat a missing optional as None (leaves the cell blank).
-        missing = [h for h in MANDATORY_HEADERS if str(h).strip() not in hdr]
-        if missing:
-            raise ValueError(f"RDP headers missing: {missing}")
-
-        df_pond = _load_pond_df(ws_pond, last_col=47)
-
-        # Wipe stale data left by a prior fill that used a different PlantSpec.
-        _clear_unused_sheets(wb_tpl, plant)
-
-        # PC template location is needed for PC extra params
-        pc_location = None
-        if "PC" in [s.name for s in wb_tpl.sheets]:
-            pc_location = wb_tpl.sheets["PC"].range("D2").value
-
-        for job in plant.jobs:
-            ws = wb_tpl.sheets[job.sheet]
-
-            # 1) header + type
-            _write_header(ws, job.sheet, job.cons, job.header_text, job.type_value)
-
-            # 2) RDP mandatory/optional
-            mandatory = _values_by_headers(ws_rdp, job.rdp_row, hdr, MANDATORY_HEADERS)
-            optional = _values_by_headers(ws_rdp, job.rdp_row, hdr, OPTIONAL_HEADERS)
-
-            # 3) Pond extract + write
-            if job.kind.upper() == "PC":
-                if pc_location is None:
-                    raise ValueError("Template PC location (PC!D2) not found but a PC job exists.")
-                names, vel_prod = pond_pc_names_velprod(df_pond, ws_pond, str(pc_location), job.pond_plant, job.pond_line)
-                _write_pc(ws, job.cons, mandatory, optional, names, vel_prod)
-
-            elif job.kind.upper() == "TC":
-                names, vel_prod = pond_default_names_velprod(
-                    df_pond, job.pond_plant, job.pond_line,
-                    aggregate=job.aggregate_skus, agg_name=job.aggregate_name,
-                )
-                _write_mandatory(ws, job.cons, ROWS_TEMPLATE_TC, mandatory)
-                _write_optional(ws, job.cons, ROWS_OPT_TC, optional, first_to_col7=18, second_from=19, second_to=23, second_col5=True, last_write_val=0)
-                _write_tc_sku(ws, job.cons, names, vel_prod)
-
-            else:  # DEFAULT
-                names, vel_prod = pond_default_names_velprod(
-                    df_pond, job.pond_plant, job.pond_line,
-                    aggregate=job.aggregate_skus, agg_name=job.aggregate_name,
-                )
-                _write_mandatory(ws, job.cons, ROWS_TEMPLATE_DEFAULT, mandatory)
-
-                if job.sheet in ("Cookies or Biscuits", "Wafer"):
-                    # 25-item array: velocity loss rows 13-17, col E second chunk starts at 18
-                    _write_optional(ws, job.cons, ROWS_OPT_COOKIES_WAFER, optional,
-                                    first_to_col7=17, second_from=18, second_to=24,
-                                    second_col5=True, last_row_idx=24)
-                else:
-                    # 26-item array: velocity loss rows 13-18 (extra row 111), col E starts at 19
-                    # final SKUS write goes to rows_opt[25]=63
-                    _write_optional(ws, job.cons, ROWS_OPT_OTHER_EXTRUDED, optional,
-                                    first_to_col7=18, second_from=19, second_to=24,
-                                    second_col5=True, last_row_idx=25)
-
-                _write_default_sku(ws, job.sheet, job.cons, names, vel_prod)
-
-        wb_tpl.app.api.CalculateFull()
+        app.calculation = "manual"   # hundreds of writes — recalc once at the end
+        sheets = {s.name: s for s in wb_tpl.sheets}
+        for w in writes:
+            if w.sheet not in sheets:
+                raise ValueError(f"Template has no sheet '{w.sheet}'.")
+            sheets[w.sheet].range((w.row, w.col)).value = w.value
+        app.calculation = "automatic"
+        app.api.CalculateFull()
         wb_tpl.save(out_path)
 
         # File is on disk. Close is best-effort: when the workbook lives on
@@ -665,10 +495,6 @@ def _fill_plant_core(db_path: str, blank_path: str, out_path: str, plant: PlantS
         # that propagate would mark a correctly-saved plant as Failed.
         try:
             wb_tpl.close()
-        except Exception:
-            pass
-        try:
-            wb_db.close()
         except Exception:
             pass
 
@@ -685,3 +511,14 @@ def _fill_plant_core(db_path: str, blank_path: str, out_path: str, plant: PlantS
                 cleanup()
             except Exception:
                 pass
+
+
+def apply_writes_openpyxl(blank_path: str, out_path: str, writes: List[Write]) -> None:
+    """Developer/test helper: apply a plan with openpyxl (no Excel, no
+    recalculation). Use only to compare input cells against a golden — the
+    real fill always goes through Excel so formulas and macros stay intact."""
+    import openpyxl
+    wb = openpyxl.load_workbook(blank_path, keep_vba=True)
+    for w in writes:
+        wb[w.sheet].cell(w.row, w.col).value = w.value
+    wb.save(out_path)

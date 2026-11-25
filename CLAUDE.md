@@ -6,13 +6,13 @@
 
 ## 1. What this is
 
-Desktop application that automatically fills **True Efficiency (TE) reporting templates** for PepsiCo Brazil's production plants. It reads a monthly consolidation database (`.xlsm`), extracts the per-plant/per-line numbers, and writes them into each plant's blank template — in minutes, instead of the week-plus it takes by hand.
+Desktop application that automatically fills **True Efficiency (TE) reporting templates** for PepsiCo Brazil's production plants. It reads the monthly True Efficiency exports (a folder of four Power BI `.xlsx` files — see §4), extracts the per-plant/per-line numbers, and writes them into a `_Filled` copy of each plant's blank template — in minutes, instead of the week-plus it takes by hand.
 
 This repo is the **Brazil instance** of the TE Automation initiative. It is a fork of the Mexico POC:
 
 - **Reference implementation:** [`TE-Automation` (Mexico)](https://github.com/p3droJosue/TE-Automation)
 - **Mexico status:** in production, 15 plants, ~35 min per cycle
-- **Brazil goal:** same outcome for Brazilian plants (TBD: confirm plant count with the Brazil team)
+- **Brazil scope:** 8 template files / 43 line blocks (Amacoco Petrolina, CIC, Feira de Santana, ITU, Lucky, NE Recife, Sete Lagoas, Sorocaba)
 
 ---
 
@@ -29,26 +29,27 @@ We deliberately did **not** merge Brazil into the Mexico app. Reasons:
 
 ---
 
-## 3. Architecture (identical to Mexico)
+## 3. Architecture (same shape as Mexico)
 
 Three modules, one responsibility each:
 
 | File                     | Owns                                                        |
 | ------------------------ | ----------------------------------------------------------- |
 | `app.py`                 | UI (CustomTkinter). Tabs, sidebar, status pills, threading. |
-| `engine.py`              | Excel automation (xlwings). All business logic.             |
-| `plants.py`              | Data registry — which plants, which Jobs, which RDP rows.   |
+| `engine.py`              | Reads the DB exports, plans cell writes, applies them in Excel (xlwings). |
+| `plants.py`              | Data registry — plants, line blocks, DB line names, SKU master. |
 
 Dependency direction:
 
 ```
-app.py  ─▶  engine.py  ─▶  (xlwings, pandas)
+app.py  ─▶  engine.py  ─▶  (openpyxl to read exports, xlwings to write templates)
 app.py  ─▶  plants.py  ─▶  engine.py (uses Job / PlantSpec)
 ```
 
-**Country-specific code lives in `plants.py`.** Everything else should stay identical to Mexico's version, which gets you the bug fixes "for free":
+**Brazil diverged from Mexico in `engine.py`'s reading/writing half** (different DB format — see §4). What is still shared with Mexico and should keep flowing both ways:
 
 - OneDrive staging (copy to temp before processing — avoids `"Cannot access"` COM errors)
+- Excel cleanup in `_fill_plant_core`'s `finally` (always quit Excel)
 - mtime verification (treat as success if the output file was actually rewritten, even if COM throws a spurious error after)
 - Fixed-height scrollable plant list with theme button pinned to the top of the sidebar
 - Apple-style per-plant status pills (Pending / Running / Done / Failed) with live summary
@@ -59,130 +60,98 @@ If you find yourself editing `engine.py` or `app.py`, pause and ask: *is this a 
 
 ---
 
-## 4. What to change for Brazil
+## 4. How the Brazil engine works
 
-### 4.1 `plants.py` — the plant registry (95% of the work)
+### 4.1 Inputs
 
-This is where Brazil differs from Mexico. Replace the full file with Brazilian plants:
+- **Databases folder** (`databases/`) with four Power BI exports, recognised by content (file names don't matter):
+  - APP downtime pivot (row 2 label `TEMPO_DBL`) — most lines
+  - ITA downtime pivot (`HORAS ITA`) — Lucky
+  - MES downtime pivot (`DT Horas`) — Sete Lagoas + ITU PC50 / DORITOS_TC1 / CLEXTRAL I & II
+  - Production list (`Planta | Linha | Corte | Sabor | Produção Real KG`)
+- **Blank template** `Snk_TE_<Plant>_P11 2026 OCT(P10 UK).xlsm`. The month in the name sets *Total calendar time* (days × 24).
+
+### 4.2 Pipeline (`engine.py`)
+
+1. `load_brazil_db(folder)` → `BrazilDB` (downtime per source/line/category, production per line).
+2. `plan_plant(db, plant, calendar_hours)` → list of `Write(sheet, row, col, value)` + warnings. **Pure Python, no Excel**, so it is testable anywhere.
+3. `fill_plant(...)` opens the blank in Excel (xlwings), applies the writes, recalculates and saves to `<template>_Filled.xlsm`. Returns the warnings; the app also saves them to `<template>_Filled_warnings.txt`.
+
+Key tables in `engine.py`:
+
+- `CATEGORY_CELLS` — DB loss category → template cell (Default layout; TC rows +1, PC rows +10). Includes the MES coarse buckets and their **assumed** destinations (pending Brazil team confirmation, see `analysis/BRAZIL_ANALYSIS.md` §5).
+- `PRODUCT_LAYOUT` / `PRODUCT_COLS` — product & production tables per layout. Column G is a formula on PC/TC/Stax and is never written.
+
+Hard rules (enforced by `analysis/check_against_golden.py`, must report `SAFETY=0`):
+
+- never write to a cell that holds a formula in the blank template;
+- never write inside a merged area (Excel refuses);
+- only write real values (output always starts from a fresh copy of the blank).
+
+### 4.3 `plants.py` — the registry + SKU master
 
 ```python
-from engine import Job, PlantSpec
-
-SAO_PAULO = PlantSpec(
-    key="SAO_PAULO",
-    jobs=[
-        Job("Extruded", "DEFAULT", 0, "1 - Line A1", 15, "PLANTA SAO PAULO", "A1", type_value="Fried"),
-        Job("Extruded", "DEFAULT", 1, "2 - Line A2", 16, "PLANTA SAO PAULO", "A2", type_value="Baked"),
-        # ... one Job per line/product on each product sheet
-    ]
-)
-
-# Repeat for each Brazilian plant
-
-REGISTRY = {
-    "SAO_PAULO": SAO_PAULO,
-    # ...
-}
-
-def match_filename(fname: str) -> str | None:
-    """Map a Brazilian template filename to a REGISTRY key."""
-    # e.g. "Snk_TE_Sao Paulo_P03 2026 ..." -> "SAO_PAULO"
+Job("Extruded", 0, "4 - Clextral", "APP", "CLEXTRAL III", type_value="Baked", te_target=0.785444, skus=(
+    SKU("CEBOLITOS", ptype="MD", seasoning=0.3331, rated=960.336, db_keys=(("CEBOLITOS", "CEBOLLA"),)),
     ...
+)),
 ```
 
-**Per-Job rules (same as Mexico):**
+- `sheet`, `cons` — template sheet and block index (0 = columns B..I).
+- `header_text` — line name exactly as in the template's dropdown.
+- `source` / `db_line` — which downtime export, and the `Linha` value in the exports.
+- `type_value`, `te_target`, `fryer` — static per-line values copied from the goldens.
+- `skus` — product table top to bottom. `db_keys` lists the `(Corte, Sabor)` pairs whose kg feed that row. A production row with no matching SKU is appended as a new row and reported as a warning ("not in the SKU master") — the fix is to add the key (or a new `SKU`) here.
 
-- `sheet` — one of `"PC"`, `"TC"`, `"Other"`, `"Extruded"`, `"Cookies or Biscuits"`, `"Wafer"`. The Brazilian template should use the same sheet names; if it doesn't, update `engine._PRODUCT_SHEETS` too.
-- `kind` — `"DEFAULT"`, `"TC"`, or `"PC"`. Picks the writer function.
-- `cons` — block index (0, 1, 2, …) within the sheet. Must be contiguous per sheet.
-- `rdp_row` — the row number in `Reporte Detalle Plantas` (Brazilian DB) for this line.
-- `pond_plant` / `pond_line` — the plant name and line code as they appear in the `Pond` sheet.
+`plants.py` was bootstrapped from the OCT 2026 goldens by `analysis/build_plants_from_goldens.py`; it is now edited by hand.
 
-### 4.2 `engine.py` constants — only if Brazil needs them
+### 4.4 Not filled by the engine (analyst fills by hand)
 
-Review and adjust if the Brazilian DB differs:
-
-- **`MANDATORY_HEADERS`** — must appear in the DB's RDP sheet. If Brazilian DB uses Portuguese names ("Horas Totais" instead of "Total Hours"), either (a) translate the list here, or (b) ask the Brazil team if English headers can be preserved. Option (a) is fine; keep the list in Portuguese if that's the source of truth.
-- **`OPTIONAL_HEADERS`** — same, in Portuguese if needed.
-- **`ROWS_TEMPLATE_DEFAULT` / `_TC` / `_PC`** — only if the Brazilian template has different row layouts. Unlikely but verify by opening a sample.
-- **`BLOCK_WIDTH`** — 8 columns per block. Almost certainly identical.
-- **`_PRODUCT_SHEETS`** — sheet names in the template. If translated to Portuguese, update here.
-
-### 4.3 Branding in `app.py`
-
-Minimal changes:
-
-```python
-self.title("TE Template Filler — Brazil")         # was: "— Mexico"
-# ...
-ctk.CTkLabel(sb, text="Brazil Sites", ...)        # was: "Mexico Sites"
-```
-
-Logo: PepsiCo logo stays the same (global brand). If a Brazil-specific sub-brand is wanted, drop a new PNG in `assets/` and point `logo_path` at it.
-
-### 4.4 Build output name
-
-In `build.spec`:
-
-```python
-exe = EXE(
-    ...,
-    name="TE_Filler_Brazil",      # was: "TE_Filler"
-    ...
-)
-```
-
-So the `.exe` is distinguishable in Explorer / Task Manager from the Mexico one.
+Rate/T-put losses (G106–G111), PC gross solids (C17), # FG SKUs, Stax line type (formula). Anything the DB doesn't carry for that month stays blank.
 
 ### 4.5 What you should NOT change
 
-- Core fill loop in `engine.py` (`_fill_plant_core`) — the open/read/write/save sequence is country-agnostic.
-- OneDrive staging logic (`fill_plant`, `_is_onedrive_path`) — benefits Brazil immediately.
-- mtime verification — same.
+- OneDrive staging (`fill_plant`, `_is_onedrive_path`) and the mtime safety net.
 - UI structure in `app.py` — Single Plant tab, Run All tab, status cards, status pills.
-- Writer functions (`_write_mandatory`, `_write_optional`, `_write_pc`, `_write_tc_sku`, `_write_default_sku`) — these implement the template's cell layout, which is the same per the Brazil team.
+- The safety rules in §4.2.
 
 ---
 
-## 5. Getting started (Brazil onboarding checklist)
+## 5. Testing & running
 
-1. **Get artifacts from the Brazil team:**
-   - One monthly TE database `.xlsm` (recent month).
-   - One **completed** template per plant (the "golden" to diff against).
-   - One **blank** template per plant.
-   - A mapping sheet: for each Brazilian plant, which lines run on which product sheet (`PC` / `TC` / `Other` / `Extruded` / `Cookies or Biscuits` / `Wafer`), and which RDP row each line corresponds to.
+### 5.1 Without Excel (any OS) — check the plan against the goldens
 
-2. **Set up the dev environment:**
-   ```powershell
-   git clone <this-repo>
-   cd TE-Automation-Brazil
-   python -m venv .venv
-   .venv\Scripts\Activate.ps1
-   pip install customtkinter xlwings pandas pillow openpyxl pyinstaller
-   ```
+```bash
+pip install openpyxl
+python analysis/check_against_golden.py            # summary per plant; SAFETY must be 0
+python analysis/check_against_golden.py ITU -v     # every DIFF / MANUAL cell for one plant
+```
 
-3. **Verify the Mexican code still runs** (sanity check that the fork works):
-   ```powershell
-   cd modular_architecture
-   python app.py
-   ```
-   It'll still show Mexican plants — that's expected before you replace `plants.py`.
+`DIFF` today is expected: the OCT exports exclude 27–31 Oct while the goldens cover the full month, and MES lacks the dark-hour / breakdown detail (see `analysis/BRAZIL_ANALYSIS.md`).
 
-4. **Replace `plants.py`** with the Brazilian registry (see §4.1).
+### 5.2 With Excel (Windows) — the real run
 
-5. **Test one plant end-to-end:**
-   - Pick one simple Brazilian plant.
-   - Run the Single Plant tab.
-   - Diff the filled output against the golden template.
-   - Fix any `rdp_row` / `pond_line` mismatches until they match.
+```powershell
+git clone https://github.com/p3droJosue/TE-Automation-Brazil.git
+cd TE-Automation-Brazil
+git checkout claude/eager-galileo-fbakkz
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install customtkinter xlwings openpyxl pillow pyinstaller
+cd modular_architecture
+python app.py
+```
 
-6. **Expand to all plants**, then run the Run All tab against the folder containing every Brazilian blank template.
+- **Run All tab:** Databases folder = `..\databases`, Templates folder = `..\templates\TE_blank_templates` → one `_Filled.xlsm` per plant next to the blanks (blanks are never overwritten).
+- **Single Plant tab:** pick a plant in the sidebar, Databases folder, and one blank template.
+- **CLI:** `python app.py --db ..\databases --folder ..\templates\TE_blank_templates --all`
+- Then open each `_Filled.xlsm` next to the golden in `templates\TE_completed_templates\` and compare.
 
-7. **Build the .exe** and ship to the Brazil analyst team:
-   ```powershell
-   pyinstaller build.spec
-   # output: dist/TE_Filler_Brazil.exe
-   ```
+### 5.3 Build the .exe
+
+```powershell
+pyinstaller build.spec      # → dist\TE_Filler_Brazil.exe
+```
 
 ---
 
@@ -191,7 +160,7 @@ So the `.exe` is distinguishable in Explorer / Task Manager from the Mexico one.
 Since Brazil and Mexico are forks, bug fixes don't flow automatically. The workflow:
 
 - **New fix lands on Mexico:** open its PR on `p3droJosue/TE-Automation`.
-- **Mirror in Brazil:** cherry-pick the commit (or manually apply the diff) to this repo. The diff usually touches `engine.py` or `app.py` and is identical.
+- **Mirror in Brazil:** fixes to `app.py` (UI) and to the staging / Excel-cleanup parts of `engine.py` port directly. Fixes to Mexico's RDP/Pond readers and writers do **not** apply — Brazil has its own.
 - **Test in Brazil:** quick Run All to confirm no Brazilian regression.
 - **Push.**
 
@@ -201,13 +170,11 @@ Once the shared-core refactor lands (§8), this manual sync goes away.
 
 ## 7. Common pitfalls for Brazil specifically
 
-- **Portuguese column headers in the database.** If the Brazilian DB uses "Horas Totais" / "Manutenção" / etc., `MANDATORY_HEADERS` has to be translated. Check with the Brazil team which language the DB is published in.
-- **Different plant/line naming in Pond.** `pond_line` values are case-insensitive but exact-match. Brazilian codes may be `L1`, `L2` instead of `A1`, `A2`. Open the Pond sheet to confirm.
-- **Filename patterns.** Mexican templates follow `Snk_TE_<Plant>_P<period> <year> <month>(P<x> UK).xlsm`. Brazilian names may differ; update `match_filename()` accordingly or the Run All tab won't match anything.
-- **OneDrive tenant naming.** Mexico uses `OneDrive - Pepsico`. Brazil may be `OneDrive - PepsiCo` (case) or `OneDrive - Pepsico do Brasil`. The staging detector is case-insensitive and matches any folder containing "onedrive", so this should Just Work — but confirm.
-- **`Reporte Detalle Plantas` sheet name.** Mexico has this (Spanish). Brazil may use a Portuguese equivalent ("Relatório Detalhado das Plantas" or similar). If so, update the fallback in `_pick_sheet()` or rename the sheet lookup.
-
----
+- **Export period.** The exports must cover the same days as the template (the OCT 2026 files exclude 27–31 Oct, so they don't reproduce the goldens).
+- **MES coarse buckets.** MES has no dark-hour or Tech/Op split; `CATEGORY_CELLS` puts them on assumed cells (Other / Technical / External). Confirm with the Brazil team.
+- **New products.** A new Corte/Sabor in the production export shows up as a warning and an extra product row without type/throughput (Excel shows #DIV/0 on that row) — add it to the SKU master in `plants.py`.
+- **Filename pattern.** `match_filename()` matches plant keywords in `Snk_TE_<Plant>_P11 2026 OCT(P10 UK).xlsm`; the month/year in the name drives calendar hours.
+- **OneDrive tenant naming.** The staging detector is case-insensitive and matches any path containing "onedrive".
 
 ### 7.1 What we actually found (OCT 2026 analysis)
 
@@ -251,10 +218,10 @@ Trigger to start the refactor: when APAC or AMESA comes on board and we're stari
 
 | Need to…                                   | Edit                                       |
 | ------------------------------------------ | ------------------------------------------ |
-| Add a Brazilian plant                      | `plants.py` — new `PlantSpec` + `REGISTRY` |
-| Change which template sheet a line writes  | `plants.py` — `Job.sheet`                  |
-| Fix a wrong number for a line              | `plants.py` — `Job.rdp_row` or `pond_line` |
-| Translate RDP headers                      | `engine.py` — `MANDATORY_HEADERS`          |
+| Add a line / plant                         | `plants.py` — new `Job` / `PlantSpec` + `REGISTRY` + `_FNAME_KEYWORDS` |
+| Map a new product (Corte/Sabor)            | `plants.py` — `SKU(..., db_keys=...)`      |
+| Fix a wrong hour cell                      | `engine.py` — `CATEGORY_CELLS`             |
+| Check the plan without Excel               | `python analysis/check_against_golden.py`  |
 | Change window title                        | `app.py` — `self.title(...)`               |
 | Change `.exe` name                         | `build.spec` — `name="..."`                |
 | Rebuild EXE                                | `pyinstaller build.spec` (close old .exe first) |

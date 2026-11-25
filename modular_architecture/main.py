@@ -12,7 +12,7 @@ from plants import REGISTRY
 
 def run_gui():
     root = tk.Tk()
-    root.title("TE Template Filler (Mexico)")
+    root.title("TE Template Filler (Brazil)")
     root.geometry("900x360")
 
     db_var = tk.StringVar()
@@ -22,10 +22,7 @@ def run_gui():
     visible_var = tk.BooleanVar(value=False)
 
     def browse_db():
-        path = filedialog.askopenfilename(
-            title="Select DB (.xlsm)",
-            filetypes=[("Excel Macro-Enabled", "*.xlsm"), ("All files", "*.*")]
-        )
+        path = filedialog.askdirectory(title="Select databases folder")
         if path:
             db_var.set(path)
 
@@ -53,8 +50,8 @@ def run_gui():
         out = out_var.get().strip()
         plant_key = plant_var.get().strip().upper()
 
-        if not db or not os.path.exists(db):
-            messagebox.showerror("Missing file", "Please select a valid DB .xlsm")
+        if not db or not os.path.isdir(db):
+            messagebox.showerror("Missing folder", "Please select the databases folder")
             return
         if not blank or not os.path.exists(blank):
             messagebox.showerror("Missing file", "Please select a valid Blank TE template .xlsm")
@@ -69,8 +66,11 @@ def run_gui():
         try:
             btn_run.config(state="disabled")
             root.update_idletasks()
-            fill_plant(db, blank, out, REGISTRY[plant_key], visible=visible_var.get())
-            messagebox.showinfo("Success", f"Filled TE saved:\n{out}")
+            warnings = fill_plant(db, blank, out, REGISTRY[plant_key], visible=visible_var.get())
+            msg = f"Filled TE saved:\n{out}"
+            if warnings:
+                msg += "\n\nWarnings:\n" + "\n".join(warnings[:10])
+            messagebox.showinfo("Success", msg)
         except Exception as e:
             messagebox.showerror("Error", str(e))
         finally:
@@ -80,7 +80,7 @@ def run_gui():
     frm = ttk.Frame(root)
     frm.pack(fill="both", expand=True)
 
-    ttk.Label(frm, text="DB (.xlsm):").grid(row=0, column=0, sticky="w", **pad)
+    ttk.Label(frm, text="Databases folder:").grid(row=0, column=0, sticky="w", **pad)
     ttk.Entry(frm, textvariable=db_var, width=95).grid(row=0, column=1, **pad)
     ttk.Button(frm, text="Browse", command=browse_db).grid(row=0, column=2, **pad)
 
@@ -107,7 +107,7 @@ def run_gui():
 def run_cli():
     import argparse
     p = argparse.ArgumentParser()
-    p.add_argument("--db", required=True)
+    p.add_argument("--db", required=True, help="databases folder")
     p.add_argument("--blank", required=True)
     p.add_argument("--plant", required=True)
     p.add_argument("--out", default="")
@@ -119,8 +119,10 @@ def run_cli():
         raise ValueError(f"Unknown plant '{plant_key}'. Available: {sorted(REGISTRY.keys())}")
 
     out = args.out.strip() or default_out_path(args.blank)
-    fill_plant(args.db, args.blank, out, REGISTRY[plant_key], visible=args.visible)
+    warnings = fill_plant(args.db, args.blank, out, REGISTRY[plant_key], visible=args.visible)
     print(f"✅ Saved filled TE: {out}")
+    for w in warnings:
+        print(f"  ! {w}")
 
 
 if __name__ == "__main__":

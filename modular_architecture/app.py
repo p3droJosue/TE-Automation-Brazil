@@ -10,7 +10,7 @@ import customtkinter as ctk
 from PIL import Image
 from tkinter import filedialog
 
-from engine import fill_plant
+from engine import default_out_path, fill_plant
 from plants import REGISTRY, find_templates, match_filename
 
 
@@ -42,6 +42,23 @@ def _save_config(cfg: dict) -> None:
         pass
 
 
+def _warnings_path(out_path: str) -> str:
+    return os.path.splitext(out_path)[0] + "_warnings.txt"
+
+
+def _write_warnings(out_path: str, warnings: list[str]) -> None:
+    """Save the run's warnings next to the filled file (removes a stale log)."""
+    path = _warnings_path(out_path)
+    try:
+        if warnings:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("\n".join(warnings) + "\n")
+        elif os.path.exists(path):
+            os.remove(path)
+    except OSError:
+        pass
+
+
 # ── Apple-style status palette ────────────────────────────────────────────────
 # Soft tinted backgrounds + saturated text. Each color is (light, dark).
 _STATUS = {
@@ -64,8 +81,8 @@ def _short_error(msg: str) -> str:
             line = line[len(pref):].strip()
             break
     low = line.lower()
-    if "rdp headers missing" in low:
-        return "Database is missing required columns."
+    if "databases folder" in low:
+        return line[:200]
     if ("another program" in low or "permission denied" in low
             or "being used by" in low or "in use" in low):
         return "Template file is open in Excel — close it and try again."
@@ -174,7 +191,7 @@ class App(ctk.CTk):
 
     def __init__(self):
         super().__init__()
-        self.title("TE Template Filler — Mexico")
+        self.title("TE Template Filler — Brazil")
         # Default size is large enough to show the full sidebar (logo + 15
         # plants + theme button) plus the main panel without scrolling. The
         # user can still maximize or resize; the sidebar plant list scrolls
@@ -227,7 +244,7 @@ class App(ctk.CTk):
             sb, text="TE Filler", font=ctk.CTkFont(size=20, weight="bold")
         ).grid(row=1, column=0, padx=16, pady=(4, 4), sticky="w")
         ctk.CTkLabel(
-            sb, text="Mexico Sites", font=ctk.CTkFont(size=12), text_color="gray"
+            sb, text="Brazil Sites", font=ctk.CTkFont(size=12), text_color="gray"
         ).grid(row=2, column=0, padx=16, pady=(0, 12), sticky="w")
 
         # Theme toggle lives in the top section so the user can always see
@@ -316,7 +333,7 @@ class App(ctk.CTk):
         self._db_var    = ctk.StringVar()
         self._blank_var = ctk.StringVar()
 
-        file_row(1, "Database (.xlsm):",   self._db_var,    self._browse_db)
+        file_row(1, "Databases folder:",   self._db_var,    self._browse_db)
         file_row(2, "Template (.xlsm):",   self._blank_var, self._browse_blank)
 
         opts = ctk.CTkFrame(parent, fg_color="transparent")
@@ -368,7 +385,7 @@ class App(ctk.CTk):
         self._batch_db_var     = ctk.StringVar()
         self._batch_folder_var = ctk.StringVar()
 
-        file_row(1, "Database (.xlsm):",   self._batch_db_var,     self._browse_batch_db)
+        file_row(1, "Databases folder:",   self._batch_db_var,     self._browse_batch_db)
         file_row(2, "Templates Folder:",   self._batch_folder_var, self._browse_batch_folder)
 
         opts = ctk.CTkFrame(parent, fg_color="transparent")
@@ -455,7 +472,7 @@ class App(ctk.CTk):
             self._sync_theme_button()
 
         db = self._cfg.get("last_db", "")
-        if db and os.path.exists(db):
+        if db and os.path.isdir(db):
             self._db_var.set(db)
             self._batch_db_var.set(db)
 
@@ -484,9 +501,8 @@ class App(ctk.CTk):
 
     # ── File pickers — single plant ───────────────────────────────────────────
     def _browse_db(self):
-        path = filedialog.askopenfilename(
-            title="Select Database (.xlsm)",
-            filetypes=[("Excel Macro-Enabled", "*.xlsm"), ("All files", "*.*")],
+        path = filedialog.askdirectory(
+            title="Select the databases folder (APP / ITA / MES / production exports)",
         )
         if path:
             self._db_var.set(path)
@@ -504,9 +520,8 @@ class App(ctk.CTk):
 
     # ── File pickers — batch ──────────────────────────────────────────────────
     def _browse_batch_db(self):
-        path = filedialog.askopenfilename(
-            title="Select Database (.xlsm)",
-            filetypes=[("Excel Macro-Enabled", "*.xlsm"), ("All files", "*.*")],
+        path = filedialog.askdirectory(
+            title="Select the databases folder (APP / ITA / MES / production exports)",
         )
         if path:
             self._batch_db_var.set(path)
@@ -540,10 +555,10 @@ class App(ctk.CTk):
         blank     = self._blank_var.get().strip()
         plant_key = self._selected_plant
 
-        if not db or not os.path.exists(db):
+        if not db or not os.path.isdir(db):
             self._status_card.set_state(
-                "failed", "Missing database",
-                "Pick a valid .xlsm database file before running.",
+                "failed", "Missing databases folder",
+                "Pick the folder with the four True Efficiency exports before running.",
             )
             return
         if not blank or not os.path.exists(blank):
@@ -570,26 +585,30 @@ class App(ctk.CTk):
         self._progress.configure(mode="indeterminate")
         self._progress.start()
 
+        out = default_out_path(blank)
+
         def _worker():
             try:
-                fill_plant(db, blank, blank, REGISTRY[plant_key],
-                           visible=self._visible_var.get())
-                self.after(0, self._on_success, blank)
+                warnings = fill_plant(db, blank, out, REGISTRY[plant_key],
+                                      visible=self._visible_var.get())
+                _write_warnings(out, warnings)
+                self.after(0, self._on_success, out, warnings)
             except Exception as exc:
                 self.after(0, self._on_error, str(exc))
 
         threading.Thread(target=_worker, daemon=True).start()
 
-    def _on_success(self, out_path: str):
+    def _on_success(self, out_path: str, warnings: list[str] | None = None):
         self._progress.stop()
         self._progress.set(1)
         self._run_btn.configure(state="normal", text="Run Fill")
         self._running = False
         pretty = (self._selected_plant or "").replace("_", " ").title()
-        self._status_card.set_state(
-            "done", f"{pretty} — Done",
-            f"Saved {os.path.basename(out_path)}.",
-        )
+        detail = f"Saved {os.path.basename(out_path)}."
+        if warnings:
+            detail += (f"\n{len(warnings)} warning(s) — see {os.path.basename(_warnings_path(out_path))}:\n• "
+                       + "\n• ".join(warnings[:3]))
+        self._status_card.set_state("done", f"{pretty} — Done", detail)
 
     def _on_error(self, exc_msg: str):
         self._progress.stop()
@@ -609,9 +628,9 @@ class App(ctk.CTk):
         db     = self._batch_db_var.get().strip()
         folder = self._batch_folder_var.get().strip()
 
-        if not db or not os.path.exists(db):
+        if not db or not os.path.isdir(db):
             self._batch_summary.configure(
-                text="Missing database — pick a .xlsm file.",
+                text="Missing databases folder.",
                 text_color=_STATUS["failed"]["fg"],
             )
             return
@@ -645,11 +664,14 @@ class App(ctk.CTk):
             for i, (key, fpath) in enumerate(matches, start=1):
                 self.after(0, self._mark_row, key, "running", "Working…")
                 try:
-                    fill_plant(db, fpath, fpath, REGISTRY[key],
-                               visible=self._batch_visible_var.get())
+                    out = default_out_path(fpath)
+                    warnings = fill_plant(db, fpath, out, REGISTRY[key],
+                                          visible=self._batch_visible_var.get())
+                    _write_warnings(out, warnings)
                     done += 1
+                    note = f" — {len(warnings)} warning(s)" if warnings else ""
                     self.after(0, self._mark_row, key, "done",
-                               os.path.basename(fpath))
+                               os.path.basename(out) + note)
                 except Exception as exc:
                     failed += 1
                     self.after(0, self._mark_row, key, "failed",
@@ -686,7 +708,7 @@ if __name__ == "__main__":
     if len(sys.argv) > 1:
         import argparse
         p = argparse.ArgumentParser()
-        p.add_argument("--db",      required=True)
+        p.add_argument("--db",      required=True, help="databases folder")
         p.add_argument("--blank",   default="")
         p.add_argument("--folder",  default="")
         p.add_argument("--plant",   default="")
@@ -702,12 +724,16 @@ if __name__ == "__main__":
                 sys.exit(1)
             matches = find_templates(args.folder)
             if not matches:
-                print("No matching _blank.xlsm templates found.")
+                print("No matching .xlsm templates found.")
                 sys.exit(1)
             for key, fpath in matches:
                 print(f"Filling {key} …")
-                fill_plant(args.db, fpath, fpath, REGISTRY[key], visible=args.visible)
-                print(f"  → saved: {fpath}")
+                out = default_out_path(fpath)
+                warnings = fill_plant(args.db, fpath, out, REGISTRY[key], visible=args.visible)
+                _write_warnings(out, warnings)
+                print(f"  → saved: {out}")
+                for w in warnings:
+                    print(f"     ! {w}")
             print("All done.")
         else:
             key = args.plant.strip().upper()
@@ -715,8 +741,11 @@ if __name__ == "__main__":
                 print(f"Unknown plant '{key}'. Available: {sorted(REGISTRY.keys())}")
                 sys.exit(1)
             out = args.out.strip() or default_out_path(args.blank)
-            fill_plant(args.db, args.blank, out, REGISTRY[key], visible=args.visible)
+            warnings = fill_plant(args.db, args.blank, out, REGISTRY[key], visible=args.visible)
+            _write_warnings(out, warnings)
             print(f"Done. Saved to: {out}")
+            for w in warnings:
+                print(f"  ! {w}")
     else:
         app = App()
         app.mainloop()
